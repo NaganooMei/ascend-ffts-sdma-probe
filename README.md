@@ -50,7 +50,7 @@ cmake --build build -j
 | `--lanes` | `1` | FFTS ready context 数上限。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
-| `--host-mem` | `aclrt` | host buffer 类型，支持 `aclrt`、`malloc`、`registered`、`registered-mapped`、`aclrt-registered` 和 `aclrt-registered-mapped`。 |
+| `--host-mem` | `aclrt` | `h2d-sdma` 被测 source buffer 的 host 内存类型，支持 `aclrt`、`malloc`、`registered`、`registered-mapped`、`aclrt-registered` 和 `aclrt-registered-mapped`。 |
 
 ## 结果判断
 
@@ -62,3 +62,9 @@ cmake --build build -j
 - `--host-mem aclrt-registered-mapped` 会使用 `aclrtMallocHost` + `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` + `aclrtHostGetDevicePointer`，FFTS descriptor 使用 mapped 地址。
 
 输出中的 `avg_us` 和 `bandwidth_gib_s` 只覆盖 FFTS launch 到 stream synchronize 的区间，不包含辅助初始化和校验 memcpy。
+
+注册和 mapped 地址相关的诊断日志会输出到 stderr，包括 host pointer、4K 对齐结果、注册 flag、注册返回值、mapped pointer 和最终写入 FFTS descriptor 的 source 地址。如果要保存日志，可以这样运行：
+
+```bash
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem aclrt-registered-mapped 2>&1 | tee h2d_aclrt_registered_mapped.log
+```

@@ -215,6 +215,11 @@ bool IsAligned(const void* ptr, size_t alignment)
     return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
 }
 
+const char* BoolText(bool value)
+{
+    return value ? "true" : "false";
+}
+
 size_t ParseSize(const std::string& text)
 {
     if (text.empty()) {
@@ -412,10 +417,12 @@ public:
         if (bytes == 0) {
             Fail("invalid host allocation size");
         }
+        bytes_ = bytes;
         if (UsesAclrtHostAllocation(kind_)) {
             allocationBytes_ =
                 IsRegisteredHostMemory(kind_) ? RoundUp(bytes, kHostRegisterAlignment) : bytes;
             CheckAcl(aclrtMallocHost(&ptr_, allocationBytes_), "aclrtMallocHost");
+            TraceAllocation("aclrtMallocHost");
             if (IsRegisteredHostMemory(kind_)) {
                 Register();
             }
@@ -431,6 +438,7 @@ public:
                 Fail("posix_memalign failed");
             }
 #endif
+            TraceAllocation("aligned-host");
             Register();
         } else {
             ptr_ = std::malloc(bytes);
@@ -438,8 +446,8 @@ public:
                 Fail("malloc failed");
             }
             allocationBytes_ = bytes;
+            TraceAllocation("malloc");
         }
-        bytes_ = bytes;
     }
 
     ~HostBuffer()
@@ -448,9 +456,17 @@ public:
             return;
         }
         if (registered_) {
-            (void)aclrtHostUnregister(ptr_);
+            std::cerr << "trace host_unregister begin"
+                      << " kind=" << HostMemoryName(kind_)
+                      << " host_ptr=" << ptr_
+                      << std::endl;
+            const auto ret = aclrtHostUnregister(ptr_);
+            std::cerr << "trace host_unregister end"
+                      << " kind=" << HostMemoryName(kind_)
+                      << " ret=" << static_cast<int32_t>(ret)
+                      << std::endl;
         }
-        if (kind_ == HostMemoryKind::Aclrt) {
+        if (UsesAclrtHostAllocation(kind_)) {
             (void)aclrtFreeHost(ptr_);
         } else if (IsRegisteredHostMemory(kind_)) {
 #if defined(_WIN32)
@@ -473,13 +489,21 @@ public:
 
     void* FftsSourcePtr() const
     {
+        void* fftsSource = ptr_;
         if (UsesMappedHostAddress(kind_)) {
             if (mappedDevicePtr_ == nullptr) {
                 Fail("registered-mapped host buffer has no mapped device pointer");
             }
-            return mappedDevicePtr_;
+            fftsSource = mappedDevicePtr_;
         }
-        return ptr_;
+        std::cerr << "trace h2d_ffts_source"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " host_ptr=" << ptr_
+                  << " mapped_ptr=" << mappedDevicePtr_
+                  << " ffts_src=" << fftsSource
+                  << " bytes=" << bytes_
+                  << std::endl;
+        return fftsSource;
     }
 
     size_t Bytes() const
@@ -488,6 +512,19 @@ public:
     }
 
 private:
+    void TraceAllocation(const char* allocator) const
+    {
+        std::cerr << "trace host_alloc"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " allocator=" << allocator
+                  << " ptr=" << ptr_
+                  << " requested_bytes=" << bytes_
+                  << " allocation_bytes=" << allocationBytes_
+                  << " aligned4k=" << BoolText(ptr_ != nullptr &&
+                                               IsAligned(ptr_, kHostRegisterAlignment))
+                  << std::endl;
+    }
+
     void Register()
     {
         if (!IsAligned(ptr_, kHostRegisterAlignment)) {
@@ -501,14 +538,45 @@ private:
             flag |= ACL_HOST_REG_PINNED;
         }
 #endif
-        CheckAcl(aclrtHostRegisterV2(ptr_, allocationBytes_, flag), "aclrtHostRegisterV2");
+        std::cerr << "trace host_register_v2 begin"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " host_ptr=" << ptr_
+                  << " size=" << allocationBytes_
+                  << " flag=0x" << std::hex << flag << std::dec
+                  << std::endl;
+        auto ret = aclrtHostRegisterV2(ptr_, allocationBytes_, flag);
+        std::cerr << "trace host_register_v2 end"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " ret=" << static_cast<int32_t>(ret)
+                  << std::endl;
+        CheckAcl(ret, "aclrtHostRegisterV2");
         registered_ = true;
-        CheckAcl(aclrtHostGetDevicePointer(ptr_, &mappedDevicePtr, 0),
-                 "aclrtHostGetDevicePointer");
+        std::cerr << "trace host_get_device_pointer begin"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " host_ptr=" << ptr_
+                  << std::endl;
+        ret = aclrtHostGetDevicePointer(ptr_, &mappedDevicePtr, 0);
+        std::cerr << "trace host_get_device_pointer end"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " ret=" << static_cast<int32_t>(ret)
+                  << " mapped_ptr=" << mappedDevicePtr
+                  << std::endl;
+        CheckAcl(ret, "aclrtHostGetDevicePointer");
 #else
-        CheckAcl(aclrtHostRegister(ptr_, allocationBytes_, ACL_HOST_REGISTER_MAPPED,
-                                   &mappedDevicePtr),
-                 "aclrtHostRegister");
+        std::cerr << "trace host_register begin"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " host_ptr=" << ptr_
+                  << " size=" << allocationBytes_
+                  << " flag=ACL_HOST_REGISTER_MAPPED"
+                  << std::endl;
+        auto ret = aclrtHostRegister(ptr_, allocationBytes_, ACL_HOST_REGISTER_MAPPED,
+                                     &mappedDevicePtr);
+        std::cerr << "trace host_register end"
+                  << " kind=" << HostMemoryName(kind_)
+                  << " ret=" << static_cast<int32_t>(ret)
+                  << " mapped_ptr=" << mappedDevicePtr
+                  << std::endl;
+        CheckAcl(ret, "aclrtHostRegister");
         registered_ = true;
 #endif
         mappedDevicePtr_ = mappedDevicePtr;
@@ -767,9 +835,9 @@ void PrintResult(const std::string& modeName, size_t bytes, double avgUs)
 
 void RunD2DSdma(aclrtStream stream, const Options& opt)
 {
-    HostBuffer hostSource(opt.bytes, opt.hostMemory);
-    HostBuffer hostZero(opt.bytes, opt.hostMemory);
-    HostBuffer hostVerify(opt.bytes, opt.hostMemory);
+    HostBuffer hostSource(opt.bytes, HostMemoryKind::Aclrt);
+    HostBuffer hostZero(opt.bytes, HostMemoryKind::Aclrt);
+    HostBuffer hostVerify(opt.bytes, HostMemoryKind::Aclrt);
     DeviceBuffer deviceSource(opt.bytes);
     DeviceBuffer deviceDestination(opt.bytes);
 
@@ -796,8 +864,8 @@ void RunD2DSdma(aclrtStream stream, const Options& opt)
 void RunH2DSdma(aclrtStream stream, const Options& opt)
 {
     HostBuffer hostSource(opt.bytes, opt.hostMemory);
-    HostBuffer hostZero(opt.bytes, opt.hostMemory);
-    HostBuffer hostVerify(opt.bytes, opt.hostMemory);
+    HostBuffer hostZero(opt.bytes, HostMemoryKind::Aclrt);
+    HostBuffer hostVerify(opt.bytes, HostMemoryKind::Aclrt);
     DeviceBuffer deviceDestination(opt.bytes);
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
