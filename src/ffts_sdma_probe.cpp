@@ -46,6 +46,8 @@ enum class HostMemoryKind {
     Malloc,
     Registered,
     RegisteredMapped,
+    AclrtRegistered,
+    AclrtRegisteredMapped,
 };
 
 struct Options {
@@ -140,6 +142,10 @@ std::string HostMemoryName(HostMemoryKind kind)
             return "registered";
         case HostMemoryKind::RegisteredMapped:
             return "registered-mapped";
+        case HostMemoryKind::AclrtRegistered:
+            return "aclrt-registered";
+        case HostMemoryKind::AclrtRegisteredMapped:
+            return "aclrt-registered-mapped";
     }
     return "unknown";
 }
@@ -158,17 +164,39 @@ HostMemoryKind ParseHostMemory(const std::string& text)
     if (text == "registered-mapped") {
         return HostMemoryKind::RegisteredMapped;
     }
+    if (text == "aclrt-registered") {
+        return HostMemoryKind::AclrtRegistered;
+    }
+    if (text == "aclrt-registered-mapped") {
+        return HostMemoryKind::AclrtRegisteredMapped;
+    }
     Fail("invalid --host-mem: " + text);
 }
 
 bool IsRegisteredHostMemory(HostMemoryKind kind)
 {
-    return kind == HostMemoryKind::Registered || kind == HostMemoryKind::RegisteredMapped;
+    return kind == HostMemoryKind::Registered ||
+           kind == HostMemoryKind::RegisteredMapped ||
+           kind == HostMemoryKind::AclrtRegistered ||
+           kind == HostMemoryKind::AclrtRegisteredMapped;
 }
 
 bool UsesMappedHostAddress(HostMemoryKind kind)
 {
-    return kind == HostMemoryKind::RegisteredMapped;
+    return kind == HostMemoryKind::RegisteredMapped ||
+           kind == HostMemoryKind::AclrtRegisteredMapped;
+}
+
+bool UsesAclrtHostAllocation(HostMemoryKind kind)
+{
+    return kind == HostMemoryKind::Aclrt ||
+           kind == HostMemoryKind::AclrtRegistered ||
+           kind == HostMemoryKind::AclrtRegisteredMapped;
+}
+
+bool NeedsPinnedRegistration(HostMemoryKind kind)
+{
+    return kind == HostMemoryKind::Registered || kind == HostMemoryKind::RegisteredMapped;
 }
 
 size_t RoundUp(size_t value, size_t alignment)
@@ -180,6 +208,11 @@ size_t RoundUp(size_t value, size_t alignment)
         Fail("size overflow while aligning host allocation");
     }
     return ((value + alignment - 1) / alignment) * alignment;
+}
+
+bool IsAligned(const void* ptr, size_t alignment)
+{
+    return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
 }
 
 size_t ParseSize(const std::string& text)
@@ -241,7 +274,8 @@ void PrintUsage(const char* argv0)
         << "  --lanes N              max ready contexts, default 1\n"
         << "  --warmup N             warmup iterations, default 1\n"
         << "  --repeat N             timed iterations, default 10\n"
-        << "  --host-mem KIND        aclrt, malloc, registered, or registered-mapped, default aclrt\n"
+        << "  --host-mem KIND        aclrt, malloc, registered, registered-mapped,\n"
+        << "                         aclrt-registered, or aclrt-registered-mapped, default aclrt\n"
         << "  --help                 show this help\n";
 }
 
@@ -378,9 +412,13 @@ public:
         if (bytes == 0) {
             Fail("invalid host allocation size");
         }
-        if (kind_ == HostMemoryKind::Aclrt) {
-            CheckAcl(aclrtMallocHost(&ptr_, bytes), "aclrtMallocHost");
-            allocationBytes_ = bytes;
+        if (UsesAclrtHostAllocation(kind_)) {
+            allocationBytes_ =
+                IsRegisteredHostMemory(kind_) ? RoundUp(bytes, kHostRegisterAlignment) : bytes;
+            CheckAcl(aclrtMallocHost(&ptr_, allocationBytes_), "aclrtMallocHost");
+            if (IsRegisteredHostMemory(kind_)) {
+                Register();
+            }
         } else if (IsRegisteredHostMemory(kind_)) {
             allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
 #if defined(_WIN32)
@@ -452,11 +490,18 @@ public:
 private:
     void Register()
     {
+        if (!IsAligned(ptr_, kHostRegisterAlignment)) {
+            Fail("registered host pointer is not 4K aligned");
+        }
         void* mappedDevicePtr = nullptr;
-#if defined(ACL_HOST_REG_MAPPED) && defined(ACL_HOST_REG_PINNED)
-        CheckAcl(aclrtHostRegisterV2(ptr_, allocationBytes_,
-                                     ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED),
-                 "aclrtHostRegisterV2");
+#if defined(ACL_HOST_REG_MAPPED)
+        uint32_t flag = ACL_HOST_REG_MAPPED;
+#if defined(ACL_HOST_REG_PINNED)
+        if (NeedsPinnedRegistration(kind_)) {
+            flag |= ACL_HOST_REG_PINNED;
+        }
+#endif
+        CheckAcl(aclrtHostRegisterV2(ptr_, allocationBytes_, flag), "aclrtHostRegisterV2");
         registered_ = true;
         CheckAcl(aclrtHostGetDevicePointer(ptr_, &mappedDevicePtr, 0),
                  "aclrtHostGetDevicePointer");

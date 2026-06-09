@@ -36,6 +36,7 @@ cmake --build build -j
 ```bash
 ./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem registered
 ./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem aclrt-registered-mapped
 ```
 
 ## 参数
@@ -49,7 +50,7 @@ cmake --build build -j
 | `--lanes` | `1` | FFTS ready context 数上限。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
-| `--host-mem` | `aclrt` | host buffer 类型，支持 `aclrt`、`malloc`、`registered` 和 `registered-mapped`。 |
+| `--host-mem` | `aclrt` | host buffer 类型，支持 `aclrt`、`malloc`、`registered`、`registered-mapped`、`aclrt-registered` 和 `aclrt-registered-mapped`。 |
 
 ## 结果判断
 
@@ -57,5 +58,7 @@ cmake --build build -j
 - `h2d-sdma` launch 失败，通常说明当前 runtime 不接受 host source 地址进入 FFTS SDMA descriptor。
 - `--host-mem registered` 会用普通 host buffer，再调用 `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED)`，FFTS descriptor 仍使用原始 host 地址。
 - `--host-mem registered-mapped` 会使用 `aclrtHostGetDevicePointer` 返回的 mapped 地址作为 FFTS descriptor 的 source。
+- `--host-mem aclrt-registered` 会用 `aclrtMallocHost` 申请锁页 host buffer，再调用 `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)`，FFTS descriptor 仍使用原始 host 地址。
+- `--host-mem aclrt-registered-mapped` 会使用 `aclrtMallocHost` + `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` + `aclrtHostGetDevicePointer`，FFTS descriptor 使用 mapped 地址。
 
 输出中的 `avg_us` 和 `bandwidth_gib_s` 只覆盖 FFTS launch 到 stream synchronize 的区间，不包含辅助初始化和校验 memcpy。
