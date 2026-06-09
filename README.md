@@ -45,8 +45,9 @@ cmake --build build -j
 | --- | --- | --- |
 | `--device` | `0` | Ascend device id。 |
 | `--mode` | `all` | `d2d-sdma`、`h2d-sdma` 或 `all`。 |
-| `--bytes` | `1048576` | 总搬运字节数，支持 `K`、`M`、`G` 后缀。 |
-| `--frags` | `1` | 拆成多少个 SDMA context。 |
+| `--bytes` | `1048576` | 每个 IO 的字节数，支持 `K`、`M`、`G` 后缀。 |
+| `--ios` | `1` | 独立 IO 个数。`--frags 1 --ios N` 表示不拆，每个 IO 一个 SDMA context。 |
+| `--frags` | `1` | 每个 IO 拆成多少个 SDMA context。 |
 | `--lanes` | `1` | FFTS ready context 数上限。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
@@ -62,6 +63,14 @@ cmake --build build -j
 - `--host-mem aclrt-registered-mapped` 会使用 `aclrtMallocHost` + `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` + `aclrtHostGetDevicePointer`，FFTS descriptor 使用 mapped 地址。
 
 输出中的 `avg_us` 和 `bandwidth_gib_s` 只覆盖 FFTS launch 到 stream synchronize 的区间，不包含辅助初始化和校验 memcpy。
+
+如果要“不拆、一次传多个 IO”，保持 `--frags 1`，增加 `--ios`：
+
+```bash
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --ios 8 --frags 1 --lanes 8 --host-mem aclrt-registered-mapped
+```
+
+这会创建 8 个独立 SDMA context，每个 context 搬 1 MiB，总搬运量按 8 MiB 计算。输出里的 `bandwidth_gib_s` 使用总搬运量除以一次 FFTS launch + synchronize 的平均耗时。
 
 注册和 mapped 地址相关的诊断日志会输出到 stderr，包括 host pointer、4K 对齐结果、注册 flag、注册返回值、mapped pointer 和最终写入 FFTS descriptor 的 source 地址。如果要保存日志，可以这样运行：
 

@@ -54,6 +54,7 @@ struct Options {
     int32_t device{0};
     Mode mode{Mode::All};
     size_t bytes{1024 * 1024};
+    uint32_t ios{1};
     uint16_t frags{1};
     uint16_t lanes{1};
     int32_t warmup{1};
@@ -266,6 +267,28 @@ uint16_t ParseU16(const std::string& text, const char* name)
     return static_cast<uint16_t>(value);
 }
 
+uint32_t ParseU32(const std::string& text, const char* name)
+{
+    const auto value = std::stoull(text);
+    if (value == 0 || value > std::numeric_limits<uint32_t>::max()) {
+        Fail(std::string("invalid ") + name + ": " + text);
+    }
+    return static_cast<uint32_t>(value);
+}
+
+size_t CheckedMul(size_t lhs, size_t rhs, const char* name)
+{
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        Fail(std::string("size overflow for ") + name);
+    }
+    return lhs * rhs;
+}
+
+size_t TotalBytes(const Options& opt)
+{
+    return CheckedMul(opt.bytes, opt.ios, "total bytes");
+}
+
 void PrintUsage(const char* argv0)
 {
     std::cout
@@ -274,7 +297,8 @@ void PrintUsage(const char* argv0)
         << "Options:\n"
         << "  --device N             Ascend device id, default 0\n"
         << "  --mode MODE            d2d-sdma, h2d-sdma, or all, default all\n"
-        << "  --bytes BYTES          total bytes, supports K/M/G suffix, default 1048576\n"
+        << "  --bytes BYTES          bytes per IO, supports K/M/G suffix, default 1048576\n"
+        << "  --ios N                number of independent IO descriptors, default 1\n"
         << "  --frags N              number of SDMA contexts, default 1\n"
         << "  --lanes N              max ready contexts, default 1\n"
         << "  --warmup N             warmup iterations, default 1\n"
@@ -305,6 +329,8 @@ Options ParseArgs(int argc, char** argv)
             opt.mode = ParseMode(requireValue("--mode"));
         } else if (arg == "--bytes") {
             opt.bytes = ParseSize(requireValue("--bytes"));
+        } else if (arg == "--ios") {
+            opt.ios = ParseU32(requireValue("--ios"), "--ios");
         } else if (arg == "--frags") {
             opt.frags = ParseU16(requireValue("--frags"), "--frags");
         } else if (arg == "--lanes") {
@@ -323,6 +349,7 @@ Options ParseArgs(int argc, char** argv)
     if (opt.bytes < opt.frags) {
         Fail("--bytes must be >= --frags");
     }
+    (void)TotalBytes(opt);
     if (opt.warmup < 0) {
         Fail("--warmup must be >= 0");
     }
@@ -637,21 +664,34 @@ void ReadDeviceForVerify(aclrtStream stream, void* dst, size_t dstMax, const voi
     CheckAcl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(readback)");
 }
 
-std::vector<CopySpec> BuildSpecs(void* dstBase, const void* srcBase, size_t bytes, uint16_t frags)
+std::vector<CopySpec> BuildSpecs(void* dstBase,
+                                 const void* srcBase,
+                                 size_t ioBytes,
+                                 uint32_t ios,
+                                 uint16_t frags)
 {
     std::vector<CopySpec> specs;
-    specs.reserve(frags);
+    const size_t specCount = CheckedMul(ios, frags, "copy spec count");
+    if (specCount > std::numeric_limits<uint16_t>::max()) {
+        Fail("--ios * --frags exceeds FFTS context count limit");
+    }
+    specs.reserve(specCount);
 
-    const size_t base = bytes / frags;
-    const size_t remainder = bytes % frags;
-    size_t offset = 0;
-    for (uint16_t i = 0; i < frags; ++i) {
-        const size_t fragBytes = base + (i < remainder ? 1 : 0);
-        if (fragBytes == 0 || fragBytes > std::numeric_limits<uint32_t>::max()) {
-            Fail("invalid fragment size: " + std::to_string(fragBytes));
+    const size_t base = ioBytes / frags;
+    const size_t remainder = ioBytes % frags;
+    size_t ioOffset = 0;
+    for (uint32_t io = 0; io < ios; ++io) {
+        size_t fragOffset = 0;
+        for (uint16_t frag = 0; frag < frags; ++frag) {
+            const size_t fragBytes = base + (frag < remainder ? 1 : 0);
+            if (fragBytes == 0 || fragBytes > std::numeric_limits<uint32_t>::max()) {
+                Fail("invalid fragment size: " + std::to_string(fragBytes));
+            }
+            const size_t offset = ioOffset + fragOffset;
+            specs.push_back({AddBytes(dstBase, offset), AddBytes(srcBase, offset), fragBytes});
+            fragOffset += fragBytes;
         }
-        specs.push_back({AddBytes(dstBase, offset), AddBytes(srcBase, offset), fragBytes});
-        offset += fragBytes;
+        ioOffset += ioBytes;
     }
     return specs;
 }
@@ -809,7 +849,9 @@ void PrintConfig(const Options& opt)
     std::cout << "probe_config"
               << " mode=" << ModeName(opt.mode)
               << " device=" << opt.device
-              << " bytes=" << opt.bytes
+              << " io_bytes=" << opt.bytes
+              << " ios=" << opt.ios
+              << " total_bytes=" << TotalBytes(opt)
               << " frags=" << opt.frags
               << " lanes=" << opt.lanes
               << " warmup=" << opt.warmup
@@ -835,54 +877,57 @@ void PrintResult(const std::string& modeName, size_t bytes, double avgUs)
 
 void RunD2DSdma(aclrtStream stream, const Options& opt)
 {
-    HostBuffer hostSource(opt.bytes, HostMemoryKind::Aclrt);
-    HostBuffer hostZero(opt.bytes, HostMemoryKind::Aclrt);
-    HostBuffer hostVerify(opt.bytes, HostMemoryKind::Aclrt);
-    DeviceBuffer deviceSource(opt.bytes);
-    DeviceBuffer deviceDestination(opt.bytes);
+    const size_t totalBytes = TotalBytes(opt);
+    HostBuffer hostSource(totalBytes, HostMemoryKind::Aclrt);
+    HostBuffer hostZero(totalBytes, HostMemoryKind::Aclrt);
+    HostBuffer hostVerify(totalBytes, HostMemoryKind::Aclrt);
+    DeviceBuffer deviceSource(totalBytes);
+    DeviceBuffer deviceDestination(totalBytes);
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
     FillZero(hostZero.Ptr(), hostZero.Bytes());
     WriteDeviceForSetup(stream, deviceSource.Ptr(), deviceSource.Bytes(), hostSource.Ptr(),
-                        opt.bytes);
+                        totalBytes);
 
     const auto specs =
-        BuildSpecs(deviceDestination.Ptr(), deviceSource.Ptr(), opt.bytes, opt.frags);
+        BuildSpecs(deviceDestination.Ptr(), deviceSource.Ptr(), opt.bytes, opt.ios, opt.frags);
     const auto resetDestination = [&]() {
         WriteDeviceForSetup(stream, deviceDestination.Ptr(), deviceDestination.Bytes(),
-                            hostZero.Ptr(), opt.bytes);
+                            hostZero.Ptr(), totalBytes);
     };
     const double avgUs =
         RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
 
     ReadDeviceForVerify(stream, hostVerify.Ptr(), hostVerify.Bytes(), deviceDestination.Ptr(),
-                        opt.bytes);
-    VerifyPattern(hostVerify.Ptr(), opt.bytes, "d2d-sdma");
-    PrintResult("d2d-sdma", opt.bytes, avgUs);
+                        totalBytes);
+    VerifyPattern(hostVerify.Ptr(), totalBytes, "d2d-sdma");
+    PrintResult("d2d-sdma", totalBytes, avgUs);
 }
 
 void RunH2DSdma(aclrtStream stream, const Options& opt)
 {
-    HostBuffer hostSource(opt.bytes, opt.hostMemory);
-    HostBuffer hostZero(opt.bytes, HostMemoryKind::Aclrt);
-    HostBuffer hostVerify(opt.bytes, HostMemoryKind::Aclrt);
-    DeviceBuffer deviceDestination(opt.bytes);
+    const size_t totalBytes = TotalBytes(opt);
+    HostBuffer hostSource(totalBytes, opt.hostMemory);
+    HostBuffer hostZero(totalBytes, HostMemoryKind::Aclrt);
+    HostBuffer hostVerify(totalBytes, HostMemoryKind::Aclrt);
+    DeviceBuffer deviceDestination(totalBytes);
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
     FillZero(hostZero.Ptr(), hostZero.Bytes());
     const auto specs =
-        BuildSpecs(deviceDestination.Ptr(), hostSource.FftsSourcePtr(), opt.bytes, opt.frags);
+        BuildSpecs(deviceDestination.Ptr(), hostSource.FftsSourcePtr(), opt.bytes, opt.ios,
+                   opt.frags);
     const auto resetDestination = [&]() {
         WriteDeviceForSetup(stream, deviceDestination.Ptr(), deviceDestination.Bytes(),
-                            hostZero.Ptr(), opt.bytes);
+                            hostZero.Ptr(), totalBytes);
     };
     const double avgUs =
         RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
 
     ReadDeviceForVerify(stream, hostVerify.Ptr(), hostVerify.Bytes(), deviceDestination.Ptr(),
-                        opt.bytes);
-    VerifyPattern(hostVerify.Ptr(), opt.bytes, "h2d-sdma");
-    PrintResult("h2d-sdma", opt.bytes, avgUs);
+                        totalBytes);
+    VerifyPattern(hostVerify.Ptr(), totalBytes, "h2d-sdma");
+    PrintResult("h2d-sdma", totalBytes, avgUs);
 }
 
 }  // namespace
