@@ -22,6 +22,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 namespace {
 
 constexpr uint32_t kFftsSdmaFp32AtomicMoveSqe = 0x1E70;
@@ -40,6 +44,8 @@ enum class Mode {
 enum class HostMemoryKind {
     Aclrt,
     Malloc,
+    Registered,
+    RegisteredMapped,
 };
 
 struct Options {
@@ -125,7 +131,17 @@ Mode ParseMode(const std::string& text)
 
 std::string HostMemoryName(HostMemoryKind kind)
 {
-    return kind == HostMemoryKind::Aclrt ? "aclrt" : "malloc";
+    switch (kind) {
+        case HostMemoryKind::Aclrt:
+            return "aclrt";
+        case HostMemoryKind::Malloc:
+            return "malloc";
+        case HostMemoryKind::Registered:
+            return "registered";
+        case HostMemoryKind::RegisteredMapped:
+            return "registered-mapped";
+    }
+    return "unknown";
 }
 
 HostMemoryKind ParseHostMemory(const std::string& text)
@@ -136,7 +152,34 @@ HostMemoryKind ParseHostMemory(const std::string& text)
     if (text == "malloc") {
         return HostMemoryKind::Malloc;
     }
+    if (text == "registered") {
+        return HostMemoryKind::Registered;
+    }
+    if (text == "registered-mapped") {
+        return HostMemoryKind::RegisteredMapped;
+    }
     Fail("invalid --host-mem: " + text);
+}
+
+bool IsRegisteredHostMemory(HostMemoryKind kind)
+{
+    return kind == HostMemoryKind::Registered || kind == HostMemoryKind::RegisteredMapped;
+}
+
+bool UsesMappedHostAddress(HostMemoryKind kind)
+{
+    return kind == HostMemoryKind::RegisteredMapped;
+}
+
+size_t RoundUp(size_t value, size_t alignment)
+{
+    if (alignment == 0) {
+        Fail("invalid alignment");
+    }
+    if (value > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+        Fail("size overflow while aligning host allocation");
+    }
+    return ((value + alignment - 1) / alignment) * alignment;
 }
 
 size_t ParseSize(const std::string& text)
@@ -198,7 +241,7 @@ void PrintUsage(const char* argv0)
         << "  --lanes N              max ready contexts, default 1\n"
         << "  --warmup N             warmup iterations, default 1\n"
         << "  --repeat N             timed iterations, default 10\n"
-        << "  --host-mem KIND        aclrt or malloc, default aclrt\n"
+        << "  --host-mem KIND        aclrt, malloc, registered, or registered-mapped, default aclrt\n"
         << "  --help                 show this help\n";
 }
 
@@ -337,11 +380,26 @@ public:
         }
         if (kind_ == HostMemoryKind::Aclrt) {
             CheckAcl(aclrtMallocHost(&ptr_, bytes), "aclrtMallocHost");
+            allocationBytes_ = bytes;
+        } else if (IsRegisteredHostMemory(kind_)) {
+            allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
+#if defined(_WIN32)
+            ptr_ = _aligned_malloc(allocationBytes_, kHostRegisterAlignment);
+            if (ptr_ == nullptr) {
+                Fail("_aligned_malloc failed");
+            }
+#else
+            if (posix_memalign(&ptr_, kHostRegisterAlignment, allocationBytes_) != 0) {
+                Fail("posix_memalign failed");
+            }
+#endif
+            Register();
         } else {
             ptr_ = std::malloc(bytes);
             if (ptr_ == nullptr) {
                 Fail("malloc failed");
             }
+            allocationBytes_ = bytes;
         }
         bytes_ = bytes;
     }
@@ -351,8 +409,17 @@ public:
         if (ptr_ == nullptr) {
             return;
         }
+        if (registered_) {
+            (void)aclrtHostUnregister(ptr_);
+        }
         if (kind_ == HostMemoryKind::Aclrt) {
             (void)aclrtFreeHost(ptr_);
+        } else if (IsRegisteredHostMemory(kind_)) {
+#if defined(_WIN32)
+            _aligned_free(ptr_);
+#else
+            std::free(ptr_);
+#endif
         } else {
             std::free(ptr_);
         }
@@ -366,15 +433,50 @@ public:
         return ptr_;
     }
 
+    void* FftsSourcePtr() const
+    {
+        if (UsesMappedHostAddress(kind_)) {
+            if (mappedDevicePtr_ == nullptr) {
+                Fail("registered-mapped host buffer has no mapped device pointer");
+            }
+            return mappedDevicePtr_;
+        }
+        return ptr_;
+    }
+
     size_t Bytes() const
     {
         return bytes_;
     }
 
 private:
+    void Register()
+    {
+        void* mappedDevicePtr = nullptr;
+#if defined(ACL_HOST_REG_MAPPED) && defined(ACL_HOST_REG_PINNED)
+        CheckAcl(aclrtHostRegisterV2(ptr_, allocationBytes_,
+                                     ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED),
+                 "aclrtHostRegisterV2");
+        registered_ = true;
+        CheckAcl(aclrtHostGetDevicePointer(ptr_, &mappedDevicePtr, 0),
+                 "aclrtHostGetDevicePointer");
+#else
+        CheckAcl(aclrtHostRegister(ptr_, allocationBytes_, ACL_HOST_REGISTER_MAPPED,
+                                   &mappedDevicePtr),
+                 "aclrtHostRegister");
+        registered_ = true;
+#endif
+        mappedDevicePtr_ = mappedDevicePtr;
+    }
+
+    static constexpr size_t kHostRegisterAlignment = 4096;
+
     void* ptr_{nullptr};
+    void* mappedDevicePtr_{nullptr};
     size_t bytes_{0};
+    size_t allocationBytes_{0};
     HostMemoryKind kind_{HostMemoryKind::Aclrt};
+    bool registered_{false};
 };
 
 uint8_t PatternAt(size_t index)
@@ -655,7 +757,8 @@ void RunH2DSdma(aclrtStream stream, const Options& opt)
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
     FillZero(hostZero.Ptr(), hostZero.Bytes());
-    const auto specs = BuildSpecs(deviceDestination.Ptr(), hostSource.Ptr(), opt.bytes, opt.frags);
+    const auto specs =
+        BuildSpecs(deviceDestination.Ptr(), hostSource.FftsSourcePtr(), opt.bytes, opt.frags);
     const auto resetDestination = [&]() {
         WriteDeviceForSetup(stream, deviceDestination.Ptr(), deviceDestination.Bytes(),
                             hostZero.Ptr(), opt.bytes);

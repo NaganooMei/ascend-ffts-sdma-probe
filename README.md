@@ -31,6 +31,13 @@ cmake --build build -j
 ./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 2097152 --frags 64 --lanes 8 --warmup 1 --repeat 10
 ```
 
+如果直接传 host 地址失败，可以继续比较注册后的 host 地址和 mapped device-visible 地址：
+
+```bash
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem registered
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 1 --lanes 1 --host-mem registered-mapped
+```
+
 ## 参数
 
 | 参数 | 默认值 | 说明 |
@@ -42,12 +49,13 @@ cmake --build build -j
 | `--lanes` | `1` | FFTS ready context 数上限。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
-| `--host-mem` | `aclrt` | host buffer 类型，支持 `aclrt` 和 `malloc`。 |
+| `--host-mem` | `aclrt` | host buffer 类型，支持 `aclrt`、`malloc`、`registered` 和 `registered-mapped`。 |
 
 ## 结果判断
 
 - `d2d-sdma` 成功，说明 FFTS SDMA descriptor、launch 和 stream 同步基础路径可用。
 - `h2d-sdma` launch 失败，通常说明当前 runtime 不接受 host source 地址进入 FFTS SDMA descriptor。
-- `h2d-sdma` launch 成功但校验失败，需要继续比较 `--host-mem aclrt` 和 `--host-mem malloc`，判断是否和 host 地址类型或 DMA 可见性有关。
+- `--host-mem registered` 会用普通 host buffer，再调用 `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED)`，FFTS descriptor 仍使用原始 host 地址。
+- `--host-mem registered-mapped` 会使用 `aclrtHostGetDevicePointer` 返回的 mapped 地址作为 FFTS descriptor 的 source。
 
 输出中的 `avg_us` 和 `bandwidth_gib_s` 只覆盖 FFTS launch 到 stream synchronize 的区间，不包含辅助初始化和校验 memcpy。
