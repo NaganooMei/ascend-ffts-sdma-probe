@@ -83,9 +83,3 @@ cmake --build build -j
 - `d2d-sdma`: host pattern 先通过 ACL copy 写入 device source，FFTS D2D 后再读回 destination 校验。
 - `h2d-sdma`: host source 写 pattern，FFTS H2D 后读回 device destination 校验。
 - `h2h-sdma`: host source 写 pattern，FFTS H2H 后直接校验 host destination。
-
-注册和 mapped 地址相关的诊断日志会输出到 stderr，包括 host pointer、4K 对齐结果、注册 flag、注册返回值、mapped pointer 和最终写入 FFTS descriptor 的地址。如果要保存日志，可以这样运行：
-
-```bash
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 4M --frags 1000 --lanes 8 --host-mem aclrt-registered-mapped 2>&1 | tee h2d_4m_x1000.log
-```

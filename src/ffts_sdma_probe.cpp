@@ -195,11 +195,6 @@ bool IsAligned(const void* ptr, size_t alignment)
     return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
 }
 
-const char* BoolText(bool value)
-{
-    return value ? "true" : "false";
-}
-
 size_t ParseSize(const std::string& text)
 {
     if (text.empty()) {
@@ -453,7 +448,6 @@ public:
         if (UsesAclrtHostAllocation(kind_)) {
             allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
             CheckAcl(aclrtMallocHost(&ptr_, allocationBytes_), "aclrtMallocHost");
-            TraceAllocation("aclrtMallocHost");
             Register();
         } else if (UsesMmapHostAllocation(kind_)) {
             allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
@@ -470,7 +464,6 @@ public:
                 Fail("mmap failed");
             }
 #endif
-            TraceAllocation("mmap");
             Register();
         } else {
             allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
@@ -484,7 +477,6 @@ public:
                 Fail("posix_memalign failed");
             }
 #endif
-            TraceAllocation("posix_memalign");
             Register();
         }
     }
@@ -495,15 +487,7 @@ public:
             return;
         }
         if (registered_) {
-            std::cerr << "trace host_unregister begin"
-                      << " kind=" << HostMemoryName(kind_)
-                      << " host_ptr=" << ptr_
-                      << std::endl;
-            const auto ret = aclrtHostUnregister(ptr_);
-            std::cerr << "trace host_unregister end"
-                      << " kind=" << HostMemoryName(kind_)
-                      << " ret=" << static_cast<int32_t>(ret)
-                      << std::endl;
+            (void)aclrtHostUnregister(ptr_);
         }
         if (UsesAclrtHostAllocation(kind_)) {
             (void)aclrtFreeHost(ptr_);
@@ -533,14 +517,7 @@ public:
         if (mappedDevicePtr_ == nullptr) {
             Fail("registered mapped host buffer has no mapped device pointer");
         }
-        std::cerr << "trace ffts_descriptor_ptr"
-                  << " role=" << role
-                  << " kind=" << HostMemoryName(kind_)
-                  << " host_ptr=" << ptr_
-                  << " mapped_ptr=" << mappedDevicePtr_
-                  << " ffts_ptr=" << mappedDevicePtr_
-                  << " bytes=" << bytes_
-                  << std::endl;
+        (void)role;
         return mappedDevicePtr_;
     }
 
@@ -550,19 +527,6 @@ public:
     }
 
 private:
-    void TraceAllocation(const char* allocator) const
-    {
-        std::cerr << "trace host_alloc"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " allocator=" << allocator
-                  << " ptr=" << ptr_
-                  << " requested_bytes=" << bytes_
-                  << " allocation_bytes=" << allocationBytes_
-                  << " aligned4k=" << BoolText(ptr_ != nullptr &&
-                                               IsAligned(ptr_, kHostRegisterAlignment))
-                  << std::endl;
-    }
-
     void Register()
     {
         if (!IsAligned(ptr_, kHostRegisterAlignment)) {
@@ -576,44 +540,14 @@ private:
             flag |= ACL_HOST_REG_PINNED;
         }
 #endif
-        std::cerr << "trace host_register_v2 begin"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " host_ptr=" << ptr_
-                  << " size=" << allocationBytes_
-                  << " flag=0x" << std::hex << flag << std::dec
-                  << std::endl;
         auto ret = aclrtHostRegisterV2(ptr_, allocationBytes_, flag);
-        std::cerr << "trace host_register_v2 end"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " ret=" << static_cast<int32_t>(ret)
-                  << std::endl;
         CheckAcl(ret, "aclrtHostRegisterV2");
         registered_ = true;
-        std::cerr << "trace host_get_device_pointer begin"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " host_ptr=" << ptr_
-                  << std::endl;
         ret = aclrtHostGetDevicePointer(ptr_, &mappedDevicePtr, 0);
-        std::cerr << "trace host_get_device_pointer end"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " ret=" << static_cast<int32_t>(ret)
-                  << " mapped_ptr=" << mappedDevicePtr
-                  << std::endl;
         CheckAcl(ret, "aclrtHostGetDevicePointer");
 #else
-        std::cerr << "trace host_register begin"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " host_ptr=" << ptr_
-                  << " size=" << allocationBytes_
-                  << " flag=ACL_HOST_REGISTER_MAPPED"
-                  << std::endl;
         auto ret = aclrtHostRegister(ptr_, allocationBytes_, ACL_HOST_REGISTER_MAPPED,
                                      &mappedDevicePtr);
-        std::cerr << "trace host_register end"
-                  << " kind=" << HostMemoryName(kind_)
-                  << " ret=" << static_cast<int32_t>(ret)
-                  << " mapped_ptr=" << mappedDevicePtr
-                  << std::endl;
         CheckAcl(ret, "aclrtHostRegister");
         registered_ = true;
 #endif
