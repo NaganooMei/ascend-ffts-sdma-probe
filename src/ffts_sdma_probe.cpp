@@ -38,6 +38,7 @@ static_assert(sizeof(rtFftsPlusSdmaCtx_t) == 128, "rtFftsPlusSdmaCtx_t must be 1
 enum class Mode {
     D2DSdma,
     H2DSdma,
+    H2HSdma,
     All,
 };
 
@@ -111,6 +112,8 @@ std::string ModeName(Mode mode)
             return "d2d-sdma";
         case Mode::H2DSdma:
             return "h2d-sdma";
+        case Mode::H2HSdma:
+            return "h2h-sdma";
         case Mode::All:
             return "all";
     }
@@ -124,6 +127,9 @@ Mode ParseMode(const std::string& text)
     }
     if (text == "h2d-sdma") {
         return Mode::H2DSdma;
+    }
+    if (text == "h2h-sdma") {
+        return Mode::H2HSdma;
     }
     if (text == "all") {
         return Mode::All;
@@ -291,7 +297,7 @@ void PrintUsage(const char* argv0)
         << "\n"
         << "Options:\n"
         << "  --device N             Ascend device id, default 0\n"
-        << "  --mode MODE            d2d-sdma, h2d-sdma, or all, default all\n"
+        << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma, or all, default all\n"
         << "  --bytes BYTES          bytes per SDMA IO, supports K/M/G suffix, default 1048576\n"
         << "  --frags N              number of independent SDMA IO descriptors, default 1\n"
         << "  --lanes N              max ready contexts, default 1\n"
@@ -903,6 +909,26 @@ void RunH2DSdma(aclrtStream stream, const Options& opt)
     PrintResult("h2d-sdma", totalBytes, avgUs);
 }
 
+void RunH2HSdma(aclrtStream stream, const Options& opt)
+{
+    const size_t totalBytes = TotalBytes(opt);
+    HostBuffer hostSource(totalBytes, HostMemoryKind::Aclrt);
+    HostBuffer hostDestination(totalBytes, HostMemoryKind::Aclrt);
+
+    FillPattern(hostSource.Ptr(), hostSource.Bytes());
+    FillZero(hostDestination.Ptr(), hostDestination.Bytes());
+    const auto specs =
+        BuildSpecs(hostDestination.Ptr(), hostSource.Ptr(), opt.bytes, opt.frags);
+    const auto resetDestination = [&]() {
+        FillZero(hostDestination.Ptr(), hostDestination.Bytes());
+    };
+    const double avgUs =
+        RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
+
+    VerifyPattern(hostDestination.Ptr(), totalBytes, "h2h-sdma");
+    PrintResult("h2h-sdma", totalBytes, avgUs);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -914,6 +940,9 @@ int main(int argc, char** argv)
         AclRuntime runtime(opt.device);
         if (opt.mode == Mode::All || opt.mode == Mode::D2DSdma) {
             RunD2DSdma(runtime.Stream(), opt);
+        }
+        if (opt.mode == Mode::All || opt.mode == Mode::H2HSdma) {
+            RunH2HSdma(runtime.Stream(), opt);
         }
         if (opt.mode == Mode::All || opt.mode == Mode::H2DSdma) {
             RunH2DSdma(runtime.Stream(), opt);
