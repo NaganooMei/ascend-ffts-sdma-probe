@@ -24,11 +24,11 @@ cmake --build build -j
 ./build/ffts_sdma_probe --device 0 --mode all --bytes 1048576 --frags 1 --lanes 1 --warmup 1 --repeat 10
 ```
 
-再跑多 descriptor 和多 ready lane：
+再跑多 descriptor 和多 ready lane。这里是 8 个 1 MiB IO：
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 2097152 --frags 64 --lanes 8 --warmup 1 --repeat 10
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 2097152 --frags 64 --lanes 8 --warmup 1 --repeat 10
+./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 1048576 --frags 8 --lanes 8 --warmup 1 --repeat 10
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 8 --lanes 8 --warmup 1 --repeat 10
 ```
 
 如果直接传 host 地址失败，可以继续比较注册后的 host 地址和 mapped device-visible 地址：
@@ -45,9 +45,8 @@ cmake --build build -j
 | --- | --- | --- |
 | `--device` | `0` | Ascend device id。 |
 | `--mode` | `all` | `d2d-sdma`、`h2d-sdma` 或 `all`。 |
-| `--bytes` | `1048576` | 每个 IO 的字节数，支持 `K`、`M`、`G` 后缀。 |
-| `--ios` | `1` | 独立 IO 个数。`--frags 1 --ios N` 表示不拆，每个 IO 一个 SDMA context。 |
-| `--frags` | `1` | 每个 IO 拆成多少个 SDMA context。 |
+| `--bytes` | `1048576` | 每个 SDMA IO 的字节数，支持 `K`、`M`、`G` 后缀。 |
+| `--frags` | `1` | 独立 SDMA IO descriptor 个数。`--bytes 1M --frags 8` 表示一次提交 8 个 1 MiB IO。 |
 | `--lanes` | `1` | FFTS ready context 数上限。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
@@ -64,10 +63,10 @@ cmake --build build -j
 
 输出中的 `avg_us` 和 `bandwidth_gib_s` 只覆盖 FFTS launch 到 stream synchronize 的区间，不包含辅助初始化和校验 memcpy。
 
-如果要“不拆、一次传多个 IO”，保持 `--frags 1`，增加 `--ios`：
+如果要“一次传多个 IO”，增加 `--frags`。此时 `--bytes` 仍然是单个 IO 的大小：
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --ios 8 --frags 1 --lanes 8 --host-mem aclrt-registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 1048576 --frags 8 --lanes 8 --host-mem aclrt-registered-mapped
 ```
 
 这会创建 8 个独立 SDMA context，每个 context 搬 1 MiB，总搬运量按 8 MiB 计算。输出里的 `bandwidth_gib_s` 使用总搬运量除以一次 FFTS launch + synchronize 的平均耗时。
