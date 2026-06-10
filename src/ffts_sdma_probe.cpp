@@ -55,7 +55,7 @@ struct Options {
     Mode mode{Mode::All};
     size_t bytes{1024 * 1024};
     uint16_t frags{1};
-    uint16_t lanes{0};
+    uint16_t lanes{8};
     int32_t warmup{1};
     int32_t repeat{10};
     HostMemoryKind hostMemory{HostMemoryKind::AclrtRegisteredMapped};
@@ -274,7 +274,7 @@ void PrintUsage(const char* argv0)
         << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma, or all, default all\n"
         << "  --bytes BYTES          bytes per SDMA IO, supports K/M/G suffix, default 1048576\n"
         << "  --frags N              number of independent SDMA IO descriptors, default 1\n"
-        << "  --lanes N              max ready contexts, 0 means auto, default 0\n"
+        << "  --lanes N              max ready contexts, 0 means auto, default 8\n"
         << "  --warmup N             warmup iterations, default 1\n"
         << "  --repeat N             timed iterations, default 10\n"
         << "  --host-mem KIND        registered-mapped, mmap-registered-mapped,\n"

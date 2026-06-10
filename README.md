@@ -25,7 +25,7 @@ cmake --build build -j
 | `--mode` | `all` | `d2d-sdma`、`h2d-sdma`、`h2h-sdma` 或 `all`。 |
 | `--bytes` | `1048576` | 单个 SDMA IO 的字节数，支持 `K`、`M`、`G` 后缀。 |
 | `--frags` | `1` | 独立 SDMA IO descriptor 个数。 |
-| `--lanes` | `0` | FFTS ready context 上限；`0` 表示自动等于本次 descriptor 数。 |
+| `--lanes` | `8` | FFTS ready context 上限；`0` 表示自动等于本次 descriptor 数。 |
 | `--warmup` | `1` | 不计时 warmup 次数。 |
 | `--repeat` | `10` | 计时次数。 |
 | `--host-mem` | `aclrt-registered-mapped` | `h2d-sdma` 和 `h2h-sdma` 的 host buffer 类型。 |
@@ -42,21 +42,21 @@ cmake --build build -j
 
 下面每个 case 都给两组默认配置：
 
-- 大 IO：单个 IO 为 4 MiB，一次提交 1000 个 descriptor，`--lanes 0`。
+- 大 IO：单个 IO 为 4 MiB，一次提交 1000 个 descriptor，`--lanes 8`。
 - 小 IO：单个 IO 为 32 KiB，一次提交 1000 个 descriptor，其他配置相同。
 
 ### D2D
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 4M --frags 1000 --lanes 0 --warmup 1 --repeat 10
-./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 32K --frags 1000 --lanes 0 --warmup 1 --repeat 10
+./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 4M --frags 1000 --lanes 8 --warmup 1 --repeat 10
+./build/ffts_sdma_probe --device 0 --mode d2d-sdma --bytes 32K --frags 1000 --lanes 8 --warmup 1 --repeat 10
 ```
 
 ### H2D
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 4M --frags 1000 --lanes 0 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 32K --frags 1000 --lanes 0 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 4M --frags 1000 --lanes 8 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 32K --frags 1000 --lanes 8 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
 ```
 
 如果要比较三种 mapped host 内存，把 `--host-mem` 换成：
@@ -70,8 +70,8 @@ cmake --build build -j
 ### H2H
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode h2h-sdma --bytes 4M --frags 1000 --lanes 0 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
-./build/ffts_sdma_probe --device 0 --mode h2h-sdma --bytes 32K --frags 1000 --lanes 0 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2h-sdma --bytes 4M --frags 1000 --lanes 8 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
+./build/ffts_sdma_probe --device 0 --mode h2h-sdma --bytes 32K --frags 1000 --lanes 8 --warmup 1 --repeat 10 --host-mem aclrt-registered-mapped
 ```
 
 ## 结果和校验
@@ -87,5 +87,5 @@ cmake --build build -j
 注册和 mapped 地址相关的诊断日志会输出到 stderr，包括 host pointer、4K 对齐结果、注册 flag、注册返回值、mapped pointer 和最终写入 FFTS descriptor 的地址。如果要保存日志，可以这样运行：
 
 ```bash
-./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 4M --frags 1000 --lanes 0 --host-mem aclrt-registered-mapped 2>&1 | tee h2d_4m_x1000.log
+./build/ffts_sdma_probe --device 0 --mode h2d-sdma --bytes 4M --frags 1000 --lanes 8 --host-mem aclrt-registered-mapped 2>&1 | tee h2d_4m_x1000.log
 ```
