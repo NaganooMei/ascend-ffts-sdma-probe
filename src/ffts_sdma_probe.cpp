@@ -39,6 +39,7 @@ enum class Mode {
     D2DSdma,
     H2DSdma,
     H2HSdma,
+    H2HRegisteredMappedSdma,
     All,
 };
 
@@ -114,6 +115,8 @@ std::string ModeName(Mode mode)
             return "h2d-sdma";
         case Mode::H2HSdma:
             return "h2h-sdma";
+        case Mode::H2HRegisteredMappedSdma:
+            return "h2h-registered-mapped-sdma";
         case Mode::All:
             return "all";
     }
@@ -130,6 +133,9 @@ Mode ParseMode(const std::string& text)
     }
     if (text == "h2h-sdma") {
         return Mode::H2HSdma;
+    }
+    if (text == "h2h-registered-mapped-sdma") {
+        return Mode::H2HRegisteredMappedSdma;
     }
     if (text == "all") {
         return Mode::All;
@@ -297,7 +303,8 @@ void PrintUsage(const char* argv0)
         << "\n"
         << "Options:\n"
         << "  --device N             Ascend device id, default 0\n"
-        << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma, or all, default all\n"
+        << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma,\n"
+        << "                         h2h-registered-mapped-sdma, or all, default all\n"
         << "  --bytes BYTES          bytes per SDMA IO, supports K/M/G suffix, default 1048576\n"
         << "  --frags N              number of independent SDMA IO descriptors, default 1\n"
         << "  --lanes N              max ready contexts, default 1\n"
@@ -509,23 +516,24 @@ public:
         return ptr_;
     }
 
-    void* FftsSourcePtr() const
+    void* FftsDescriptorPtr(const char* role) const
     {
-        void* fftsSource = ptr_;
+        void* fftsPtr = ptr_;
         if (UsesMappedHostAddress(kind_)) {
             if (mappedDevicePtr_ == nullptr) {
                 Fail("registered-mapped host buffer has no mapped device pointer");
             }
-            fftsSource = mappedDevicePtr_;
+            fftsPtr = mappedDevicePtr_;
         }
-        std::cerr << "trace h2d_ffts_source"
+        std::cerr << "trace ffts_descriptor_ptr"
+                  << " role=" << role
                   << " kind=" << HostMemoryName(kind_)
                   << " host_ptr=" << ptr_
                   << " mapped_ptr=" << mappedDevicePtr_
-                  << " ffts_src=" << fftsSource
+                  << " ffts_ptr=" << fftsPtr
                   << " bytes=" << bytes_
                   << std::endl;
-        return fftsSource;
+        return fftsPtr;
     }
 
     size_t Bytes() const
@@ -895,7 +903,8 @@ void RunH2DSdma(aclrtStream stream, const Options& opt)
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
     FillZero(hostZero.Ptr(), hostZero.Bytes());
     const auto specs =
-        BuildSpecs(deviceDestination.Ptr(), hostSource.FftsSourcePtr(), opt.bytes, opt.frags);
+        BuildSpecs(deviceDestination.Ptr(), hostSource.FftsDescriptorPtr("src"), opt.bytes,
+                   opt.frags);
     const auto resetDestination = [&]() {
         WriteDeviceForSetup(stream, deviceDestination.Ptr(), deviceDestination.Bytes(),
                             hostZero.Ptr(), totalBytes);
@@ -929,6 +938,26 @@ void RunH2HSdma(aclrtStream stream, const Options& opt)
     PrintResult("h2h-sdma", totalBytes, avgUs);
 }
 
+void RunH2HRegisteredMappedSdma(aclrtStream stream, const Options& opt)
+{
+    const size_t totalBytes = TotalBytes(opt);
+    HostBuffer hostSource(totalBytes, HostMemoryKind::AclrtRegisteredMapped);
+    HostBuffer hostDestination(totalBytes, HostMemoryKind::AclrtRegisteredMapped);
+
+    FillPattern(hostSource.Ptr(), hostSource.Bytes());
+    FillZero(hostDestination.Ptr(), hostDestination.Bytes());
+    const auto specs = BuildSpecs(hostDestination.FftsDescriptorPtr("dst"),
+                                  hostSource.FftsDescriptorPtr("src"), opt.bytes, opt.frags);
+    const auto resetDestination = [&]() {
+        FillZero(hostDestination.Ptr(), hostDestination.Bytes());
+    };
+    const double avgUs =
+        RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
+
+    VerifyPattern(hostDestination.Ptr(), totalBytes, "h2h-registered-mapped-sdma");
+    PrintResult("h2h-registered-mapped-sdma", totalBytes, avgUs);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -943,6 +972,9 @@ int main(int argc, char** argv)
         }
         if (opt.mode == Mode::All || opt.mode == Mode::H2HSdma) {
             RunH2HSdma(runtime.Stream(), opt);
+        }
+        if (opt.mode == Mode::All || opt.mode == Mode::H2HRegisteredMappedSdma) {
+            RunH2HRegisteredMappedSdma(runtime.Stream(), opt);
         }
         if (opt.mode == Mode::All || opt.mode == Mode::H2DSdma) {
             RunH2DSdma(runtime.Stream(), opt);
