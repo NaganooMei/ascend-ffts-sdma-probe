@@ -24,6 +24,8 @@
 
 #if defined(_WIN32)
 #include <malloc.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -39,16 +41,12 @@ enum class Mode {
     D2DSdma,
     H2DSdma,
     H2HSdma,
-    H2HRegisteredMappedSdma,
     All,
 };
 
 enum class HostMemoryKind {
-    Aclrt,
-    Malloc,
-    Registered,
     RegisteredMapped,
-    AclrtRegistered,
+    MmapRegisteredMapped,
     AclrtRegisteredMapped,
 };
 
@@ -57,10 +55,10 @@ struct Options {
     Mode mode{Mode::All};
     size_t bytes{1024 * 1024};
     uint16_t frags{1};
-    uint16_t lanes{1};
+    uint16_t lanes{0};
     int32_t warmup{1};
     int32_t repeat{10};
-    HostMemoryKind hostMemory{HostMemoryKind::Aclrt};
+    HostMemoryKind hostMemory{HostMemoryKind::AclrtRegisteredMapped};
 };
 
 struct CopySpec {
@@ -115,8 +113,6 @@ std::string ModeName(Mode mode)
             return "h2d-sdma";
         case Mode::H2HSdma:
             return "h2h-sdma";
-        case Mode::H2HRegisteredMappedSdma:
-            return "h2h-registered-mapped-sdma";
         case Mode::All:
             return "all";
     }
@@ -134,9 +130,6 @@ Mode ParseMode(const std::string& text)
     if (text == "h2h-sdma") {
         return Mode::H2HSdma;
     }
-    if (text == "h2h-registered-mapped-sdma") {
-        return Mode::H2HRegisteredMappedSdma;
-    }
     if (text == "all") {
         return Mode::All;
     }
@@ -146,16 +139,10 @@ Mode ParseMode(const std::string& text)
 std::string HostMemoryName(HostMemoryKind kind)
 {
     switch (kind) {
-        case HostMemoryKind::Aclrt:
-            return "aclrt";
-        case HostMemoryKind::Malloc:
-            return "malloc";
-        case HostMemoryKind::Registered:
-            return "registered";
         case HostMemoryKind::RegisteredMapped:
             return "registered-mapped";
-        case HostMemoryKind::AclrtRegistered:
-            return "aclrt-registered";
+        case HostMemoryKind::MmapRegisteredMapped:
+            return "mmap-registered-mapped";
         case HostMemoryKind::AclrtRegisteredMapped:
             return "aclrt-registered-mapped";
     }
@@ -164,20 +151,11 @@ std::string HostMemoryName(HostMemoryKind kind)
 
 HostMemoryKind ParseHostMemory(const std::string& text)
 {
-    if (text == "aclrt") {
-        return HostMemoryKind::Aclrt;
-    }
-    if (text == "malloc") {
-        return HostMemoryKind::Malloc;
-    }
-    if (text == "registered") {
-        return HostMemoryKind::Registered;
-    }
     if (text == "registered-mapped") {
         return HostMemoryKind::RegisteredMapped;
     }
-    if (text == "aclrt-registered") {
-        return HostMemoryKind::AclrtRegistered;
+    if (text == "mmap-registered-mapped") {
+        return HostMemoryKind::MmapRegisteredMapped;
     }
     if (text == "aclrt-registered-mapped") {
         return HostMemoryKind::AclrtRegisteredMapped;
@@ -185,30 +163,20 @@ HostMemoryKind ParseHostMemory(const std::string& text)
     Fail("invalid --host-mem: " + text);
 }
 
-bool IsRegisteredHostMemory(HostMemoryKind kind)
-{
-    return kind == HostMemoryKind::Registered ||
-           kind == HostMemoryKind::RegisteredMapped ||
-           kind == HostMemoryKind::AclrtRegistered ||
-           kind == HostMemoryKind::AclrtRegisteredMapped;
-}
-
-bool UsesMappedHostAddress(HostMemoryKind kind)
-{
-    return kind == HostMemoryKind::RegisteredMapped ||
-           kind == HostMemoryKind::AclrtRegisteredMapped;
-}
-
 bool UsesAclrtHostAllocation(HostMemoryKind kind)
 {
-    return kind == HostMemoryKind::Aclrt ||
-           kind == HostMemoryKind::AclrtRegistered ||
-           kind == HostMemoryKind::AclrtRegisteredMapped;
+    return kind == HostMemoryKind::AclrtRegisteredMapped;
 }
 
 bool NeedsPinnedRegistration(HostMemoryKind kind)
 {
-    return kind == HostMemoryKind::Registered || kind == HostMemoryKind::RegisteredMapped;
+    return kind == HostMemoryKind::RegisteredMapped ||
+           kind == HostMemoryKind::MmapRegisteredMapped;
+}
+
+bool UsesMmapHostAllocation(HostMemoryKind kind)
+{
+    return kind == HostMemoryKind::MmapRegisteredMapped;
 }
 
 size_t RoundUp(size_t value, size_t alignment)
@@ -269,10 +237,10 @@ int32_t ParseInt32(const std::string& text, const char* name)
     return static_cast<int32_t>(value);
 }
 
-uint16_t ParseU16(const std::string& text, const char* name)
+uint16_t ParseU16(const std::string& text, const char* name, bool allowZero = false)
 {
     const auto value = std::stoull(text);
-    if (value == 0 || value > std::numeric_limits<uint16_t>::max()) {
+    if ((!allowZero && value == 0) || value > std::numeric_limits<uint16_t>::max()) {
         Fail(std::string("invalid ") + name + ": " + text);
     }
     return static_cast<uint16_t>(value);
@@ -303,15 +271,14 @@ void PrintUsage(const char* argv0)
         << "\n"
         << "Options:\n"
         << "  --device N             Ascend device id, default 0\n"
-        << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma,\n"
-        << "                         h2h-registered-mapped-sdma, or all, default all\n"
+        << "  --mode MODE            d2d-sdma, h2d-sdma, h2h-sdma, or all, default all\n"
         << "  --bytes BYTES          bytes per SDMA IO, supports K/M/G suffix, default 1048576\n"
         << "  --frags N              number of independent SDMA IO descriptors, default 1\n"
-        << "  --lanes N              max ready contexts, default 1\n"
+        << "  --lanes N              max ready contexts, 0 means auto, default 0\n"
         << "  --warmup N             warmup iterations, default 1\n"
         << "  --repeat N             timed iterations, default 10\n"
-        << "  --host-mem KIND        aclrt, malloc, registered, registered-mapped,\n"
-        << "                         aclrt-registered, or aclrt-registered-mapped, default aclrt\n"
+        << "  --host-mem KIND        registered-mapped, mmap-registered-mapped,\n"
+        << "                         or aclrt-registered-mapped, default aclrt-registered-mapped\n"
         << "  --help                 show this help\n";
 }
 
@@ -339,7 +306,7 @@ Options ParseArgs(int argc, char** argv)
         } else if (arg == "--frags") {
             opt.frags = ParseU16(requireValue("--frags"), "--frags");
         } else if (arg == "--lanes") {
-            opt.lanes = ParseU16(requireValue("--lanes"), "--lanes");
+            opt.lanes = ParseU16(requireValue("--lanes"), "--lanes", true);
         } else if (arg == "--warmup") {
             opt.warmup = ParseInt32(requireValue("--warmup"), "--warmup");
         } else if (arg == "--repeat") {
@@ -439,6 +406,42 @@ private:
     size_t bytes_{0};
 };
 
+class AclrtHostBuffer {
+public:
+    explicit AclrtHostBuffer(size_t bytes)
+    {
+        if (bytes == 0) {
+            Fail("invalid host allocation size");
+        }
+        CheckAcl(aclrtMallocHost(&ptr_, bytes), "aclrtMallocHost");
+        bytes_ = bytes;
+    }
+
+    ~AclrtHostBuffer()
+    {
+        if (ptr_ != nullptr) {
+            (void)aclrtFreeHost(ptr_);
+        }
+    }
+
+    AclrtHostBuffer(const AclrtHostBuffer&) = delete;
+    AclrtHostBuffer& operator=(const AclrtHostBuffer&) = delete;
+
+    void* Ptr() const
+    {
+        return ptr_;
+    }
+
+    size_t Bytes() const
+    {
+        return bytes_;
+    }
+
+private:
+    void* ptr_{nullptr};
+    size_t bytes_{0};
+};
+
 class HostBuffer {
 public:
     HostBuffer(size_t bytes, HostMemoryKind kind) : kind_(kind)
@@ -448,14 +451,28 @@ public:
         }
         bytes_ = bytes;
         if (UsesAclrtHostAllocation(kind_)) {
-            allocationBytes_ =
-                IsRegisteredHostMemory(kind_) ? RoundUp(bytes, kHostRegisterAlignment) : bytes;
+            allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
             CheckAcl(aclrtMallocHost(&ptr_, allocationBytes_), "aclrtMallocHost");
             TraceAllocation("aclrtMallocHost");
-            if (IsRegisteredHostMemory(kind_)) {
-                Register();
+            Register();
+        } else if (UsesMmapHostAllocation(kind_)) {
+            allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
+#if defined(_WIN32)
+            Fail("mmap-registered-mapped is not supported on Windows");
+#else
+            int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#if defined(MAP_POPULATE)
+            flags |= MAP_POPULATE;
+#endif
+            ptr_ = mmap(nullptr, allocationBytes_, PROT_READ | PROT_WRITE, flags, -1, 0);
+            if (ptr_ == MAP_FAILED) {
+                ptr_ = nullptr;
+                Fail("mmap failed");
             }
-        } else if (IsRegisteredHostMemory(kind_)) {
+#endif
+            TraceAllocation("mmap");
+            Register();
+        } else {
             allocationBytes_ = RoundUp(bytes, kHostRegisterAlignment);
 #if defined(_WIN32)
             ptr_ = _aligned_malloc(allocationBytes_, kHostRegisterAlignment);
@@ -467,15 +484,8 @@ public:
                 Fail("posix_memalign failed");
             }
 #endif
-            TraceAllocation("aligned-host");
+            TraceAllocation("posix_memalign");
             Register();
-        } else {
-            ptr_ = std::malloc(bytes);
-            if (ptr_ == nullptr) {
-                Fail("malloc failed");
-            }
-            allocationBytes_ = bytes;
-            TraceAllocation("malloc");
         }
     }
 
@@ -497,14 +507,16 @@ public:
         }
         if (UsesAclrtHostAllocation(kind_)) {
             (void)aclrtFreeHost(ptr_);
-        } else if (IsRegisteredHostMemory(kind_)) {
+        } else if (UsesMmapHostAllocation(kind_)) {
+#if !defined(_WIN32)
+            (void)munmap(ptr_, allocationBytes_);
+#endif
+        } else {
 #if defined(_WIN32)
             _aligned_free(ptr_);
 #else
             std::free(ptr_);
 #endif
-        } else {
-            std::free(ptr_);
         }
     }
 
@@ -518,22 +530,18 @@ public:
 
     void* FftsDescriptorPtr(const char* role) const
     {
-        void* fftsPtr = ptr_;
-        if (UsesMappedHostAddress(kind_)) {
-            if (mappedDevicePtr_ == nullptr) {
-                Fail("registered-mapped host buffer has no mapped device pointer");
-            }
-            fftsPtr = mappedDevicePtr_;
+        if (mappedDevicePtr_ == nullptr) {
+            Fail("registered mapped host buffer has no mapped device pointer");
         }
         std::cerr << "trace ffts_descriptor_ptr"
                   << " role=" << role
                   << " kind=" << HostMemoryName(kind_)
                   << " host_ptr=" << ptr_
                   << " mapped_ptr=" << mappedDevicePtr_
-                  << " ffts_ptr=" << fftsPtr
+                  << " ffts_ptr=" << mappedDevicePtr_
                   << " bytes=" << bytes_
                   << std::endl;
-        return fftsPtr;
+        return mappedDevicePtr_;
     }
 
     size_t Bytes() const
@@ -618,7 +626,7 @@ private:
     void* mappedDevicePtr_{nullptr};
     size_t bytes_{0};
     size_t allocationBytes_{0};
-    HostMemoryKind kind_{HostMemoryKind::Aclrt};
+    HostMemoryKind kind_{HostMemoryKind::AclrtRegisteredMapped};
     bool registered_{false};
 };
 
@@ -733,9 +741,6 @@ std::vector<rtFftsPlusComCtx_t> BuildContexts(const std::vector<CopySpec>& copie
     if (copies.empty()) {
         Fail("empty FFTS copy specs");
     }
-    if (maxReadyLanes == 0) {
-        Fail("invalid FFTS lanes");
-    }
     if (copies.size() > std::numeric_limits<uint16_t>::max()) {
         Fail("too many FFTS contexts");
     }
@@ -743,7 +748,8 @@ std::vector<rtFftsPlusComCtx_t> BuildContexts(const std::vector<CopySpec>& copie
     std::vector<rtFftsPlusComCtx_t> contexts;
     contexts.reserve(copies.size());
 
-    const auto laneCount = static_cast<uint16_t>(std::min<size_t>(copies.size(), maxReadyLanes));
+    const auto requestedLanes = maxReadyLanes == 0 ? copies.size() : maxReadyLanes;
+    const auto laneCount = static_cast<uint16_t>(std::min<size_t>(copies.size(), requestedLanes));
     std::vector<int32_t> lastTaskId(laneCount, -1);
 
     for (size_t i = 0; i < copies.size(); ++i) {
@@ -866,9 +872,9 @@ void PrintResult(const std::string& modeName, size_t bytes, double avgUs)
 void RunD2DSdma(aclrtStream stream, const Options& opt)
 {
     const size_t totalBytes = TotalBytes(opt);
-    HostBuffer hostSource(totalBytes, HostMemoryKind::Aclrt);
-    HostBuffer hostZero(totalBytes, HostMemoryKind::Aclrt);
-    HostBuffer hostVerify(totalBytes, HostMemoryKind::Aclrt);
+    AclrtHostBuffer hostSource(totalBytes);
+    AclrtHostBuffer hostZero(totalBytes);
+    AclrtHostBuffer hostVerify(totalBytes);
     DeviceBuffer deviceSource(totalBytes);
     DeviceBuffer deviceDestination(totalBytes);
 
@@ -896,8 +902,8 @@ void RunH2DSdma(aclrtStream stream, const Options& opt)
 {
     const size_t totalBytes = TotalBytes(opt);
     HostBuffer hostSource(totalBytes, opt.hostMemory);
-    HostBuffer hostZero(totalBytes, HostMemoryKind::Aclrt);
-    HostBuffer hostVerify(totalBytes, HostMemoryKind::Aclrt);
+    AclrtHostBuffer hostZero(totalBytes);
+    AclrtHostBuffer hostVerify(totalBytes);
     DeviceBuffer deviceDestination(totalBytes);
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
@@ -921,28 +927,8 @@ void RunH2DSdma(aclrtStream stream, const Options& opt)
 void RunH2HSdma(aclrtStream stream, const Options& opt)
 {
     const size_t totalBytes = TotalBytes(opt);
-    HostBuffer hostSource(totalBytes, HostMemoryKind::Aclrt);
-    HostBuffer hostDestination(totalBytes, HostMemoryKind::Aclrt);
-
-    FillPattern(hostSource.Ptr(), hostSource.Bytes());
-    FillZero(hostDestination.Ptr(), hostDestination.Bytes());
-    const auto specs =
-        BuildSpecs(hostDestination.Ptr(), hostSource.Ptr(), opt.bytes, opt.frags);
-    const auto resetDestination = [&]() {
-        FillZero(hostDestination.Ptr(), hostDestination.Bytes());
-    };
-    const double avgUs =
-        RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
-
-    VerifyPattern(hostDestination.Ptr(), totalBytes, "h2h-sdma");
-    PrintResult("h2h-sdma", totalBytes, avgUs);
-}
-
-void RunH2HRegisteredMappedSdma(aclrtStream stream, const Options& opt)
-{
-    const size_t totalBytes = TotalBytes(opt);
-    HostBuffer hostSource(totalBytes, HostMemoryKind::AclrtRegisteredMapped);
-    HostBuffer hostDestination(totalBytes, HostMemoryKind::AclrtRegisteredMapped);
+    HostBuffer hostSource(totalBytes, opt.hostMemory);
+    HostBuffer hostDestination(totalBytes, opt.hostMemory);
 
     FillPattern(hostSource.Ptr(), hostSource.Bytes());
     FillZero(hostDestination.Ptr(), hostDestination.Bytes());
@@ -954,8 +940,8 @@ void RunH2HRegisteredMappedSdma(aclrtStream stream, const Options& opt)
     const double avgUs =
         RunTimedFfts(stream, specs, opt.lanes, opt.warmup, opt.repeat, resetDestination);
 
-    VerifyPattern(hostDestination.Ptr(), totalBytes, "h2h-registered-mapped-sdma");
-    PrintResult("h2h-registered-mapped-sdma", totalBytes, avgUs);
+    VerifyPattern(hostDestination.Ptr(), totalBytes, "h2h-sdma");
+    PrintResult("h2h-sdma", totalBytes, avgUs);
 }
 
 }  // namespace
@@ -972,9 +958,6 @@ int main(int argc, char** argv)
         }
         if (opt.mode == Mode::All || opt.mode == Mode::H2HSdma) {
             RunH2HSdma(runtime.Stream(), opt);
-        }
-        if (opt.mode == Mode::All || opt.mode == Mode::H2HRegisteredMappedSdma) {
-            RunH2HRegisteredMappedSdma(runtime.Stream(), opt);
         }
         if (opt.mode == Mode::All || opt.mode == Mode::H2DSdma) {
             RunH2DSdma(runtime.Stream(), opt);
